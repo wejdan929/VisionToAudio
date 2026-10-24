@@ -3,104 +3,146 @@ import numpy as np
 import sounddevice as sd
 import queue
 import threading
+from collections import deque
 
-# --- PARAMÈTRES ---
+# --- PARAMÈTRES GLOBAUX ---
 SAMPLE_RATE = 44100
-COLUMN_DURATION = 0.04  # Durée par colonne (40ms)
-GRID_WIDTH = 16
-GRID_HEIGHT = 16
-
+DURATION = 0.05  # Courte durée pour un retour ultra-réactif au mouvement
 FREQ_MIN = 200.0
 FREQ_MAX = 4000.0
 
+def nothing(x):
+    pass
+
 def audio_worker(audio_queue):
-    """
-    Thread dédié uniquement à la lecture audio pour éviter les blocages de la vidéo.
-    """
-    frequencies = np.logspace(np.log10(FREQ_MIN), np.log10(FREQ_MAX), GRID_HEIGHT)
-    num_samples = int(SAMPLE_RATE * COLUMN_DURATION)
-    t = np.linspace(0, COLUMN_DURATION, num_samples, endpoint=False)
-    envelope = np.hanning(num_samples)
-
+    """Thread audio dédié aux sons générés par la position du stylo violet"""
     while True:
-        grid = audio_queue.get()
-        if grid is None:
-            break  # Signal d'arrêt
+        item = audio_queue.get()
+        if item is None:
+            break
+        
+        y_pos_norm, x_pos_norm, volume = item # y et x normalisés entre 0 et 1
 
-        # Balayage de la grille colonne par colonne
-        for x in range(GRID_WIDTH):
-            column_data = grid[:, x]
-            mono_signal = np.zeros(num_samples)
+        # Calcul de la fréquence selon la hauteur (Haut = aigu, Bas = grave)
+        freq = FREQ_MIN + (1.0 - y_pos_norm) * (FREQ_MAX - FREQ_MIN)
+        
+        num_samples = int(SAMPLE_RATE * DURATION)
+        t = np.linspace(0, DURATION, num_samples, endpoint=False)
+        envelope = np.hanning(num_samples)
+        
+        # Onde sinusoïdale modulée par la position
+        mono_signal = volume * np.sin(2 * np.pi * freq * t) * envelope
 
-            for y, brightness in enumerate(column_data):
-                if brightness > 0:
-                    amplitude = (brightness / 255.0) * 0.08  # Amplitude augmentée pour bien entendre
-                    freq = frequencies[GRID_HEIGHT - 1 - y]
-                    mono_signal += amplitude * np.sin(2 * np.pi * freq * t)
+        # Panning stéréo selon la position gauche/droite
+        gain_left = np.cos(x_pos_norm * np.pi / 2)
+        gain_right = np.sin(x_pos_norm * np.pi / 2)
 
-            mono_signal *= envelope
-
-            # Panning stéréo
-            x_ratio = x / (GRID_WIDTH - 1) if GRID_WIDTH > 1 else 0.5
-            gain_left = np.cos(x_ratio * np.pi / 2)
-            gain_right = np.sin(x_ratio * np.pi / 2)
-
-            stereo_frame = np.column_stack((mono_signal * gain_left, mono_signal * gain_right))
-            
-            sd.play(stereo_frame, SAMPLE_RATE)
-            sd.wait()
-
-        print("🔊 Image convertie et jouée en son !")
+        stereo_frame = np.column_stack((mono_signal * gain_left, mono_signal * gain_right))
+        
+        sd.play(stereo_frame, SAMPLE_RATE)
+        sd.wait()
         audio_queue.task_done()
 
 if __name__ == "__main__":
-    print("--- Étape 4 : Substitution Sensorielle en Direct (Webcam) ---")
-    print("Ouverture de la webcam... Appuie sur la touche 'q' dans la fenêtre vidéo pour quitter.")
+    print("--- Mode Baguette Magique / Air-Writing (Stylo Violet) ---")
+    print("Bouge ton objet violet devant la webcam pour dessiner et produire du son en direct !")
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Erreur : Impossible d'accéder à la webcam.")
         exit()
 
-    # File d'attente pour passer les grilles du thread vidéo au thread audio
-    audio_queue = queue.Queue(maxsize=2)
+    window_name = "Vision-to-Audio : Air-Writing Magic Wand"
+    cv2.namedWindow(window_name)
 
-    # Démarrage du thread audio
+    # Curseur de volume
+    cv2.createTrackbar("Volume", window_name, 10, 20, nothing)
+
+    # File d'attente pour le son
+    audio_queue = queue.Queue(maxsize=2)
     t_audio = threading.Thread(target=audio_worker, args=(audio_queue,), daemon=True)
     t_audio.start()
+
+    # Historique pour tracer la ligne magique (les 64 derniers points)
+    pts = deque(maxlen=64)
 
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("Erreur de lecture du flux vidéo.")
                 break
 
-            # 1. Miroir pour un effet plus naturel
             frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
 
-            # 2. Conversion en niveaux de gris
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # 1. Conversion en espace HSV pour détecter le VIOLET facilement
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-            # 3. Filtre de Canny pour les contours
-            edges = cv2.Canny(gray, 80, 160)
+            # Plage de couleur pour le violet/magenta (à ajuster si ton violet est très clair/foncé)
+            # Teinte (H) pour le violet tourne autour de 130-160
+            lower_purple = np.array([120, 50, 50])
+            upper_purple = np.array([165, 255, 255])
 
-            # 4. Redimensionnement en grille 16x16
-            grid = cv2.resize(edges, (GRID_WIDTH, GRID_HEIGHT), interpolation=cv2.INTER_AREA)
+            mask = cv2.inRange(hsv, lower_purple, upper_purple)
+            # Nettoyage du masque (éliminer le bruit)
+            mask = cv2.erode(mask, None, iterations=2)
+            mask = cv2.dilate(mask, None, iterations=2)
 
-            # Affichage de la vidéo de retour
-            cv2.imshow("Vision-to-Audio (Webcam Live)", edges)
+            # 2. Trouver le centre de l'objet violet
+            contours, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            center = None
 
-            # Envoyer la grille au thread audio (si la file n'est pas pleine)
-            if audio_queue.empty():
-                audio_queue.put(grid)
+            if len(contours) > 0:
+                # Trouver le plus grand contour violet
+                c = max(contours, key=cv2.contourArea)
+                ((x, y), radius) = cv2.minEnclosingCircle(c)
+                M = cv2.moments(c)
+                if M["m00"] > 0:
+                    center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
 
-            # Quitter si l'utilisateur appuie sur 'q'
+                    # Si l'objet est assez grand pour être un stylo valide
+                    if radius > 5:
+                        cv2.circle(frame, (int(x), int(y)), int(radius), (255, 0, 255), 2)
+                        cv2.circle(frame, center, 5, (0, 0, 255), -1)
+                        
+                        # Ajouter le point à l'historique de dessin
+                        pts.append(center)
+
+                        # Normaliser les coordonnées (0.0 à 1.0)
+                        x_norm = center[0] / w
+                        y_norm = center[1] / h
+
+                        vol_slider = cv2.getTrackbarPos("Volume", window_name)
+                        volume_factor = vol_slider / 100.0
+
+                        # Envoyer au thread audio
+                        if audio_queue.empty():
+                            audio_queue.put((y_norm, x_norm, volume_factor))
+            else:
+                # Si on ne voit plus le stylo, on ajoute un point vide pour couper la ligne
+                pts.append(None)
+
+            # 3. Dessiner la traînée magique (Air-Writing Trail) sur la vidéo
+            for i in range(1, len(pts)):
+                if pts[i - 1] is None or pts[i] is None:
+                    continue
+                # Épaisseur et couleur néon (Violet/Cyan)
+                thickness = int(np.sqrt(64 / float(i + 1)) * 2.5)
+                cv2.line(frame, pts[i - 1], pts[i], (255, 0, 255), thickness)
+
+            # Texte explicatif incrusté dans le style HUD futuriste
+            cv2.putText(frame, "MODE: Air-Writing Magic Wand (Stylo Violet)", (20, 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(frame, "Dessinez dans l'air pour creer du son et des symboles !", (20, 70), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+            cv2.imshow(window_name, frame)
+
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        audio_queue.put(None)  # Arrêt propre du thread audio
+        audio_queue.put(None)
         print("Programme arrêté proprement.")
